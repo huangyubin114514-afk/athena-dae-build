@@ -99,19 +99,45 @@ jobs:
         id: abi
         run: |
           cd "$WORK/src"
-          ABI=$(grep -rhoE "6\.18\.[0-9]+~[0-9a-f]{32}" bin/ build_dir/ staging_dir/ 2>/dev/null | sort -u || true)
-          echo "探测到的 ABI 串:"; echo "${ABI:-<none>}"
-          echo "期望值: 6.18.55~$EXPECT_ABI"
-          KCFG=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER/.config 2>/dev/null | head -1)
-          if [ -n "$KCFG" ]; then echo "kernel .config sha256: $(sha256sum "$KCFG")"; fi
-          if echo "$ABI" | grep -q "$EXPECT_ABI"; then
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
+          test -n "$KDIR" || { echo "找不到内核构建目录"; exit 1; }
+          VM=$(cat "$KDIR/.vermagic" 2>/dev/null || echo none)
+          echo "内核 .vermagic = $VM"
+          echo "目标值        = $EXPECT_ABI"
+          if [ -f "$KDIR/.config.set" ]; then
+            echo "=y 行数 $(grep -c '=y$' "$KDIR/.config.set")  =m 行数 $(grep -c '=m$' "$KDIR/.config.set")"
+          fi
+          echo "vermagic=$VM" >> "$GITHUB_OUTPUT"
+          if [ "$VM" = "$EXPECT_ABI" ]; then
             echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::ABI 匹配，免刷机路径成立"
+            echo "::notice::ABI 匹配（$VM），免刷机路径成立"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
-            echo "::error::ABI 不匹配"
+            echo "::error::ABI 不匹配：构建产物 $VM ≠ 现网内核 $EXPECT_ABI"
             [ "${{ inputs.force_phase2 }}" = "true" ] || exit 1
           fi
+
+      - name: 收集证据
+        if: always()
+        run: |
+          cd "$WORK/src"
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER 2>/dev/null | head -1 || true)
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          if [ -n "$KDIR" ]; then
+            cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/evidence/" 2>/dev/null || true
+            cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/evidence/" 2>/dev/null || true
+          fi
+          echo "vermagic=${{ steps.abi.outputs.vermagic }}  target=$EXPECT_ABI" > "$GITHUB_WORKSPACE/evidence/abi-result.txt"
+          ls -lh "$GITHUB_WORKSPACE/evidence" || true
+
+      - name: 上传证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abi-evidence-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: 阶段二 注入内核增量
         run: |
