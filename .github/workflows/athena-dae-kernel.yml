@@ -1,0 +1,184 @@
+name: athena-dae-kernel
+
+# 目标：给运行中的 6.18.55 内核补 BTF / cls_bpf / veth，走免刷机路线。
+#
+# 流程：
+#   阶段一  原样配置 -> 只编内核与 kmod -> 校验 kernel ABI 是否 = f589023a...
+#   阶段二  追加内核增量 -> 增量重建 -> 提取 BTF / *.ko
+#   可选    build_image=true 时额外产完整 sysupgrade 镜像（刷机备用）
+#
+# 为什么只编内核：ABI 由内核 .config 决定，而 .config 在 `make defconfig` 后即确定，
+# 与用户态包是否编译无关。只编 target/linux + package/kernel/linux 可把 3 小时压到 1 小时左右。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_phase2:
+        description: "阶段一 ABI 不匹配时仍继续阶段二（产物只能用于刷机镜像）"
+        type: boolean
+        default: false
+      build_image:
+        description: "额外构建完整 sysupgrade 镜像（耗时长，刷机才需要）"
+        type: boolean
+        default: false
+
+env:
+  COMMIT: 63c7fdb3c9685d9f497d6128d9280a772f77562d
+  EXPECT_ABI: f589023ab3530a4232ebae26a1613146
+  KVER: 6.18.55
+  WORK: /mnt/athena-build
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: 环境信息
+        run: |
+          nproc; free -h; df -h /mnt /
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libncurses-dev libssl-dev \
+            libelf-dev dwarves zstd bc rsync unzip git python3 bison flex time
+          pahole --version || true
+
+      - name: 拉取源码并锁定提交
+        run: |
+          mkdir -p "$WORK"
+          cd "$WORK"
+          git clone --filter=blob:none https://github.com/immortalwrt/immortalwrt.git src
+          cd src
+          git checkout -q "$COMMIT"
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          ./scripts/feeds update -a >/dev/null
+          ./scripts/feeds install -a >/dev/null
+          echo "feeds ok"
+
+      - name: 生成设备配置
+        run: |
+          cd "$WORK/src"
+          {
+            echo 'CONFIG_TARGET_qualcommax=y'
+            echo 'CONFIG_TARGET_qualcommax_ipq60xx=y'
+            echo 'CONFIG_TARGET_MULTI_PROFILE=y'
+            echo 'CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y'
+            echo 'CONFIG_TARGET_DEVICE_PACKAGES_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=""'
+          } > .config
+          make defconfig >/dev/null
+          grep -q "DEVICE_jdcloud_re-cs-02=y" .config || { echo "设备符号未生效"; exit 1; }
+          echo "已选设备数: $(grep -c '^CONFIG_TARGET_DEVICE_.*=y' .config)"
+
+      - name: 下载源码包
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" download >/dev/null 2>&1 || make -j"$(nproc)" download
+
+      - name: 构建工具链
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" tools/install 2>&1 | tail -20
+          make -j"$(nproc)" toolchain/install 2>&1 | tail -20
+
+      - name: 阶段一 编内核与 kmod（原样配置）
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" target/linux/compile 2>&1 | tail -30
+          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -30
+
+      - name: 阶段一 校验 ABI
+        id: abi
+        run: |
+          cd "$WORK/src"
+          ABI=$(grep -rhoE "6\.18\.[0-9]+~[0-9a-f]{32}" bin/ build_dir/ staging_dir/ 2>/dev/null | sort -u || true)
+          echo "探测到的 ABI 串:"; echo "${ABI:-<none>}"
+          echo "期望值: 6.18.55~$EXPECT_ABI"
+          KCFG=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER/.config 2>/dev/null | head -1)
+          if [ -n "$KCFG" ]; then echo "kernel .config sha256: $(sha256sum "$KCFG")"; fi
+          if echo "$ABI" | grep -q "$EXPECT_ABI"; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::ABI 匹配，免刷机路径成立"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "::error::ABI 不匹配"
+            [ "${{ inputs.force_phase2 }}" = "true" ] || exit 1
+          fi
+
+      - name: 阶段二 注入内核增量
+        run: |
+          cd "$WORK/src"
+          KCFG=$(ls target/linux/qualcommax/config-6.18 2>/dev/null || ls target/linux/qualcommax/config-* | tail -1)
+          echo "target config -> $KCFG"
+          if grep -q ATHENA_DAE_FRAGMENT "$KCFG"; then echo "已有增量"; exit 0; fi
+          cat >> "$KCFG" <<'EOF'
+
+          # ATHENA_DAE_FRAGMENT begin
+          CONFIG_DEBUG_INFO=y
+          # CONFIG_DEBUG_INFO_REDUCED is not set
+          CONFIG_DEBUG_INFO_BTF=y
+          CONFIG_DEBUG_INFO_BTF_MODULES=y
+          CONFIG_NET_CLS_BPF=m
+          CONFIG_NET_SCH_INGRESS=m
+          CONFIG_NET_SCH_CLSACT=y
+          CONFIG_NET_CLS_ACT=y
+          CONFIG_NET_INGRESS=y
+          CONFIG_NET_EGRESS=y
+          CONFIG_VETH=m
+          CONFIG_NETKIT=m
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_BPF_EVENTS=y
+          CONFIG_BPF_STREAM_PARSER=y
+          CONFIG_CGROUPS=y
+          # ATHENA_DAE_FRAGMENT end
+          EOF
+          rm -f build_dir/target-*/linux-*/linux-*/.config 2>/dev/null || true
+          echo "增量已写入，下一步增量重建"
+
+      - name: 阶段二 增量重建
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" target/linux/compile 2>&1 | tail -30
+          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -30
+
+      - name: 提取产物
+        run: |
+          cd "$WORK/src"
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
+          test -n "$KDIR"
+          mkdir -p "$WORK/out"
+          objcopy --dump-section .BTF="$WORK/out/vmlinux-$KVER" "$KDIR/vmlinux" /dev/null
+          test -s "$WORK/out/vmlinux-$KVER"
+          MAGIC=$(od -An -tx1 -N2 "$WORK/out/vmlinux-$KVER" | tr -d ' \n')
+          echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$WORK/out/vmlinux-$KVER")"
+          test "$MAGIC" = "9feb"
+          cp "$KDIR/net/sched/cls_bpf.ko" "$WORK/out/" || echo "!! cls_bpf.ko 缺失"
+          cp "$KDIR/drivers/net/veth.ko" "$WORK/out/" || echo "!! veth.ko 缺失"
+          [ -f "$KDIR/drivers/net/netkit.ko" ] && cp "$KDIR/drivers/net/netkit.ko" "$WORK/out/" || true
+          for m in "$WORK"/out/*.ko; do echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
+          cd "$WORK/out" && sha256sum ./* > SHA256SUMS && cat SHA256SUMS && ls -lh
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$WORK"/out/* "$GITHUB_WORKSPACE/artifacts/"
+
+      - name: 完整镜像（可选）
+        if: ${{ inputs.build_image }}
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" 2>&1 | tail -30
+          cp bin/targets/qualcommax/ipq60xx/*sysupgrade* "$GITHUB_WORKSPACE/artifacts/" || true
+          ls -lh "$GITHUB_WORKSPACE/artifacts"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-dae-kernel-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 结论
+        run: |
+          echo "ABI 匹配: ${{ steps.abi.outputs.match }}"
+          if [ "${{ steps.abi.outputs.match }}" = "true" ]; then
+            echo "→ 产物可挂到现网内核，走免刷机部署"
+          else
+            echo "→ 产物不可挂现网内核，只能用于刷机镜像"
+          fi
