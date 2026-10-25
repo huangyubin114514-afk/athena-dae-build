@@ -40,6 +40,17 @@ jobs:
           sudo apt-get install -y -qq build-essential libncurses-dev libssl-dev \
             libelf-dev dwarves zstd bc rsync unzip git python3 bison flex time
           pahole --version || true
+          # 释放 runner 预装的大件，给构建腾空间（临时机，删除无副作用）
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          df -h /
+          # runner 用户对 /mnt 无写权限，先建目录再改属主；空间不足则回退到 workspace
+          sudo mkdir -p "$WORK"
+          sudo chown -R "$(id -u):$(id -g)" "$WORK"
+          test -w "$WORK" || { echo "WORK 不可写"; exit 1; }
+          AVAIL=$(df -Pk "$WORK" | awk 'NR==2{printf "%d", $4/1024/1024}')
+          echo "WORK=$WORK 可用=${AVAIL}GB"
+          test "$AVAIL" -ge 25 || { echo "空间不足 25GB"; exit 1; }
 
       - name: 拉取源码并锁定提交
         run: |
