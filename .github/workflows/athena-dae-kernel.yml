@@ -22,6 +22,12 @@ on:
         type: boolean
         default: false
 
+# 关键：默认 run 走 `bash -e`（无 pipefail），`make | tail` 会把 make 的失败吞掉，
+# 出现"步骤绿色但实际编译失败"。显式指定 bash 后 GitHub 会用 -eo pipefail。
+defaults:
+  run:
+    shell: bash
+
 env:
   COMMIT: 63c7fdb3c9685d9f497d6128d9280a772f77562d
   KVER: 6.18.55
@@ -100,6 +106,7 @@ jobs:
           CONFIG_NET_INGRESS=y
           CONFIG_NET_EGRESS=y
           CONFIG_VETH=m
+          CONFIG_NETKIT=m
           CONFIG_KPROBES=y
           CONFIG_BPF_EVENTS=y
           CONFIG_BPF_STREAM_PARSER=y
@@ -112,18 +119,27 @@ jobs:
       - name: 下载源码包
         run: |
           cd "$WORK/src"
-          make -j"$(nproc)" download >/dev/null 2>&1 || make -j1 download 2>&1 | tail -20
+          make -j"$(nproc)" download > /tmp/dl.log 2>&1 || {
+            echo "并行下载失败，改单线程重试"; make -j1 download > /tmp/dl.log 2>&1 || {
+              echo "下载失败，最后 40 行："; tail -40 /tmp/dl.log; exit 1; } }
 
       - name: 构建工具链
         run: |
           cd "$WORK/src"
-          make -j"$(nproc)" toolchain/install 2>&1 | tail -20
+          make -j"$(nproc)" toolchain/install > /tmp/tc.log 2>&1 || {
+            echo "工具链失败，最后 40 行："; tail -40 /tmp/tc.log; exit 1; }
+          tail -10 /tmp/tc.log
 
       - name: 编译内核与 kmod
         run: |
           cd "$WORK/src"
-          make -j"$(nproc)" target/linux/compile 2>&1 | tail -40
-          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -20
+          set -eo pipefail
+          make -j"$(nproc)" target/linux/compile > /tmp/kbuild.log 2>&1 || {
+            echo "内核编译失败，最后 60 行："; tail -60 /tmp/kbuild.log; exit 1; }
+          tail -20 /tmp/kbuild.log
+          make -j"$(nproc)" package/kernel/linux/compile > /tmp/kmod.log 2>&1 || {
+            echo "kmod 编译失败，最后 40 行："; tail -40 /tmp/kmod.log; exit 1; }
+          tail -10 /tmp/kmod.log
 
       - name: 断言配置真的生效
         run: |
@@ -138,6 +154,7 @@ jobs:
           fail=0
           grep -q '^CONFIG_VETH=m' "$KDIR/.config.set" || { echo "::error::CONFIG_VETH 不是 m"; fail=1; }
           grep -q '^CONFIG_NET_CLS_BPF=m' "$KDIR/.config.set" || { echo "::error::CONFIG_NET_CLS_BPF 不是 m"; fail=1; }
+          grep -q '^CONFIG_NETKIT=m' "$KDIR/.config.set" || echo "::warning::CONFIG_NETKIT 未生效（回退 veth）"
           grep -q '^CONFIG_DEBUG_INFO_REDUCED=y' "$KDIR/.config.set" && { echo "::error::DEBUG_INFO_REDUCED 仍为 y"; fail=1; }
           echo "fail=$fail"
           exit $fail
@@ -195,6 +212,7 @@ jobs:
           mkdir -p "$A"
           cp "$KDIR/net/sched/cls_bpf.ko" "$A/" 2>/dev/null || echo "!! cls_bpf.ko 缺失"
           cp "$KDIR/drivers/net/veth.ko" "$A/" 2>/dev/null || echo "!! veth.ko 缺失"
+          cp "$KDIR/drivers/net/netkit.ko" "$A/" 2>/dev/null || echo "!! netkit.ko 缺失（将回退 veth）"
           cp "$KDIR/.config.set" "$A/kernel.config.set" 2>/dev/null || true
           cp "$KDIR/.vermagic" "$A/vermagic.txt" 2>/dev/null || true
           for m in "$A"/*.ko; do [ -f "$m" ] && echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
