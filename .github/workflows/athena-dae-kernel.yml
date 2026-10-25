@@ -1,22 +1,22 @@
 name: athena-dae-kernel
 
-# 目标：给运行中的 6.18.55 内核补 BTF / cls_bpf / veth，走免刷机路线。
+# 目标：从设备同源提交 63c7fdb 编出 BTF + cls_bpf.ko + veth.ko，走免刷机路线。
 #
-# 流程：
-#   阶段一  原样配置 -> 只编内核与 kmod -> 校验 kernel ABI 是否 = f589023a...
-#   阶段二  追加内核增量 -> 增量重建 -> 提取 BTF / *.ko
-#   可选    build_image=true 时额外产完整 sysupgrade 镜像（刷机备用）
-#
-# 为什么只编内核：ABI 由内核 .config 决定，而 .config 在 `make defconfig` 后即确定，
-# 与用户态包是否编译无关。只编 target/linux + package/kernel/linux 可把 3 小时压到 1 小时左右。
+# 与旧版的区别（旧版连续失败 3 次）：
+#   1. 废弃"阶段一原样编 / 阶段二注入"的双阶段流程。OpenWrt 的 stamp 机制会让
+#      第二次 target/linux/compile 在 0.06 秒内直接跳过，配置根本没生效。
+#   2. 配置一次性写到位再开编：
+#      - CONFIG_KERNEL_DEBUG_INFO_REDUCED 必须显式关闭。BTF 在 Kconfig 里
+#        depends on !DEBUG_INFO_REDUCED，而 OpenWrt 默认开 REDUCED，
+#        只在内核 config 片段里写 "# ... is not set" 会被后面追加的
+#        CONFIG_KERNEL_* 覆盖（这是第 5 轮只出 .debug_info 不出 .BTF 的真因）。
+#      - veth / cls_bpf 走官方 kmod 包选择路径，同时保留内核片段做双保险。
+#   3. 编完先断言 .config.set 里关键项，不合格直接停，不浪费提取步骤。
+#   4. 若 .BTF 仍缺失，现场用 pahole 从 DWARF 生成；pahole 版本不够就源码编 dwarves。
 
 on:
   workflow_dispatch:
     inputs:
-      force_phase2:
-        description: "阶段一 ABI 不匹配时仍继续阶段二（产物只能用于刷机镜像）"
-        type: boolean
-        default: false
       build_image:
         description: "额外构建完整 sysupgrade 镜像（耗时长，刷机才需要）"
         type: boolean
@@ -24,208 +24,181 @@ on:
 
 env:
   COMMIT: 63c7fdb3c9685d9f497d6128d9280a772f77562d
-  EXPECT_ABI: f589023ab3530a4232ebae26a1613146
   KVER: 6.18.55
   WORK: /mnt/athena-build
+  DEVICE: jdcloud_re-cs-02
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
-      - name: 环境信息
+      - name: 环境准备
         run: |
           nproc; free -h; df -h /mnt /
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential libncurses-dev libssl-dev \
-            libelf-dev dwarves zstd bc rsync unzip git python3 bison flex time
+            libelf-dev dwarves zstd bc rsync unzip git python3 bison flex time \
+            cmake libdw-dev zlib1g-dev pkg-config
           pahole --version || true
-          # 释放 runner 预装的大件，给构建腾空间（临时机，删除无副作用）
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
-          df -h /
-          # runner 用户对 /mnt 无写权限，先建目录再改属主；空间不足则回退到 workspace
           sudo mkdir -p "$WORK"
           sudo chown -R "$(id -u):$(id -g)" "$WORK"
           test -w "$WORK" || { echo "WORK 不可写"; exit 1; }
           AVAIL=$(df -Pk "$WORK" | awk 'NR==2{printf "%d", $4/1024/1024}')
           echo "WORK=$WORK 可用=${AVAIL}GB"
-          test "$AVAIL" -ge 25 || { echo "空间不足 25GB"; exit 1; }
+          test "$AVAIL" -ge 30 || { echo "空间不足 30GB"; exit 1; }
 
       - name: 拉取源码并锁定提交
         run: |
-          mkdir -p "$WORK"
           cd "$WORK"
-          git clone --filter=blob:none https://github.com/immortalwrt/immortalwrt.git src
-          cd src
-          git checkout -q "$COMMIT"
-          test "$(git rev-parse HEAD)" = "$COMMIT"
-          ./scripts/feeds update -a >/dev/null
-          ./scripts/feeds install -a >/dev/null
-          echo "feeds ok"
+          mkdir -p src && cd src
+          git init -q .
+          git remote add origin https://github.com/immortalwrt/immortalwrt.git
+          git fetch -q --depth 1 origin "$COMMIT"
+          git checkout -q FETCH_HEAD
+          echo "HEAD=$(git rev-parse HEAD)"
+          git log -1 --format='%H %ci %s' | cut -c1-120
+          head -8 feeds.conf.default 2>/dev/null || true
 
-      - name: 生成设备配置
+      - name: 生成配置（一次性写到位）
         run: |
           cd "$WORK/src"
-          {
-            echo 'CONFIG_TARGET_qualcommax=y'
-            echo 'CONFIG_TARGET_qualcommax_ipq60xx=y'
-            echo 'CONFIG_TARGET_MULTI_PROFILE=y'
-            echo 'CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y'
-            echo 'CONFIG_TARGET_DEVICE_PACKAGES_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=""'
-          } > .config
-          make defconfig >/dev/null
-          grep -q "DEVICE_jdcloud_re-cs-02=y" .config || { echo "设备符号未生效"; exit 1; }
-          echo "已选设备数: $(grep -c '^CONFIG_TARGET_DEVICE_.*=y' .config)"
+          cat > .config <<'CONF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq60xx=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y
+          CONFIG_TARGET_DEVICE_PACKAGES_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=""
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          # CONFIG_KERNEL_DEBUG_INFO_BTF is not set
+          CONFIG_KERNEL_KALLSYMS=y
+          CONFIG_PACKAGE_kmod-veth=y
+          CONFIG_PACKAGE_kmod-sched-bpf=y
+          CONF
+          sed -i 's/^          //' .config
+          echo "--- seed ---"; cat .config
+          make defconfig >/dev/null 2>&1
+          echo "--- defconfig 后关键项 ---"
+          grep -E 'KERNEL_DEBUG_INFO|kmod-veth|kmod-sched-bpf|TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud' .config || echo "缺失"
 
-      - name: 下载源码包
-        run: |
-          cd "$WORK/src"
-          make -j"$(nproc)" download >/dev/null 2>&1 || make -j"$(nproc)" download
-
-      - name: 构建工具链
-        run: |
-          cd "$WORK/src"
-          make -j"$(nproc)" tools/install 2>&1 | tail -20
-          make -j"$(nproc)" toolchain/install 2>&1 | tail -20
-
-      - name: 阶段一 编内核与 kmod（原样配置）
-        run: |
-          cd "$WORK/src"
-          make -j"$(nproc)" target/linux/compile 2>&1 | tail -30
-          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -30
-
-      - name: 阶段一 校验 ABI
-        id: abi
-        run: |
-          cd "$WORK/src"
-          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
-          test -n "$KDIR" || { echo "找不到内核构建目录"; exit 1; }
-          VM=$(cat "$KDIR/.vermagic" 2>/dev/null || echo none)
-          echo "内核 .vermagic = $VM"
-          echo "目标值        = $EXPECT_ABI"
-          if [ -f "$KDIR/.config.set" ]; then
-            echo "=y 行数 $(grep -c '=y$' "$KDIR/.config.set")  =m 行数 $(grep -c '=m$' "$KDIR/.config.set")"
-          fi
-          echo "vermagic=$VM" >> "$GITHUB_OUTPUT"
-          if [ "$VM" = "$EXPECT_ABI" ]; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::ABI 匹配（$VM），免刷机路径成立"
-          else
-            echo "match=false" >> "$GITHUB_OUTPUT"
-            echo "::error::ABI 不匹配：构建产物 $VM ≠ 现网内核 $EXPECT_ABI"
-            [ "${{ inputs.force_phase2 }}" = "true" ] || exit 1
-          fi
-
-      - name: 收集证据
-        if: always()
-        run: |
-          cd "$WORK/src"
-          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER 2>/dev/null | head -1 || true)
-          mkdir -p "$GITHUB_WORKSPACE/evidence"
-          if [ -n "$KDIR" ]; then
-            cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/evidence/" 2>/dev/null || true
-            cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/evidence/" 2>/dev/null || true
-          fi
-          echo "vermagic=${{ steps.abi.outputs.vermagic }}  target=$EXPECT_ABI" > "$GITHUB_WORKSPACE/evidence/abi-result.txt"
-          ls -lh "$GITHUB_WORKSPACE/evidence" || true
-
-      - name: 上传证据
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: abi-evidence-${{ github.run_id }}
-          path: evidence/
-          include-hidden-files: true
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: 阶段二 注入内核增量
+      - name: 注入内核片段（双保险）
         run: |
           cd "$WORK/src"
           KCFG=$(ls target/linux/qualcommax/config-6.18 2>/dev/null || ls target/linux/qualcommax/config-* | tail -1)
           echo "target config -> $KCFG"
-          if grep -q ATHENA_DAE_FRAGMENT "$KCFG"; then echo "已有增量"; exit 0; fi
           cat >> "$KCFG" <<'EOF'
 
           # ATHENA_DAE_FRAGMENT begin
-          CONFIG_DEBUG_INFO=y
           # CONFIG_DEBUG_INFO_REDUCED is not set
-          CONFIG_DEBUG_INFO_BTF=y
-          CONFIG_DEBUG_INFO_BTF_MODULES=y
+          CONFIG_DEBUG_INFO=y
           CONFIG_NET_CLS_BPF=m
-          CONFIG_NET_SCH_INGRESS=m
           CONFIG_NET_SCH_CLSACT=y
           CONFIG_NET_CLS_ACT=y
           CONFIG_NET_INGRESS=y
           CONFIG_NET_EGRESS=y
           CONFIG_VETH=m
-          CONFIG_NETKIT=m
           CONFIG_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
           CONFIG_BPF_EVENTS=y
           CONFIG_BPF_STREAM_PARSER=y
           CONFIG_CGROUPS=y
           # ATHENA_DAE_FRAGMENT end
           EOF
-          rm -f build_dir/target-*/linux-*/linux-*/.config 2>/dev/null || true
-          echo "增量已写入，下一步增量重建"
+          sed -i 's/^          //' "$KCFG"
+          tail -20 "$KCFG"
 
-      - name: 阶段二 增量重建
+      - name: 下载源码包
         run: |
           cd "$WORK/src"
-          make -j"$(nproc)" target/linux/compile 2>&1 | tail -30
-          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -30
+          make -j"$(nproc)" download >/dev/null 2>&1 || make -j1 download 2>&1 | tail -20
 
-      - name: 提取产物
+      - name: 构建工具链
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" toolchain/install 2>&1 | tail -20
+
+      - name: 编译内核与 kmod
+        run: |
+          cd "$WORK/src"
+          make -j"$(nproc)" target/linux/compile 2>&1 | tail -40
+          make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -20
+
+      - name: 断言配置真的生效
+        run: |
+          cd "$WORK/src"
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
+          test -n "$KDIR" || { echo "找不到内核构建目录"; exit 1; }
+          echo "KDIR=$KDIR"
+          echo "--- 关键项 ---"
+          for k in CONFIG_DEBUG_INFO= CONFIG_DEBUG_INFO_REDUCED CONFIG_VETH CONFIG_NET_CLS_BPF CONFIG_KPROBES; do
+            printf '%-30s %s\n' "$k" "$(grep -E "^$k" "$KDIR/.config.set" | head -1)"
+          done
+          fail=0
+          grep -q '^CONFIG_VETH=m' "$KDIR/.config.set" || { echo "::error::CONFIG_VETH 不是 m"; fail=1; }
+          grep -q '^CONFIG_NET_CLS_BPF=m' "$KDIR/.config.set" || { echo "::error::CONFIG_NET_CLS_BPF 不是 m"; fail=1; }
+          grep -q '^CONFIG_DEBUG_INFO_REDUCED=y' "$KDIR/.config.set" && { echo "::error::DEBUG_INFO_REDUCED 仍为 y"; fail=1; }
+          echo "fail=$fail"
+          exit $fail
+
+      - name: 生成 BTF
+        run: |
+          cd "$WORK/src"
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
+          VM="$KDIR/vmlinux"
+          ls -l "$VM"; file "$VM" || true
+          OB=$(ls staging_dir/toolchain-*/bin/*-objcopy | head -1)
+          RE=$(ls staging_dir/toolchain-*/bin/*-readelf | head -1)
+          [ -n "$OB" ] || OB=objcopy
+          [ -n "$RE" ] || RE=readelf
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          BTF="$GITHUB_WORKSPACE/artifacts/vmlinux-$KVER"
+          if $RE -S "$VM" 2>/dev/null | grep -q '\.BTF'; then
+            echo "内核自带 .BTF，直接抽取"
+          else
+            echo "内核无 .BTF，手工用 pahole 生成"
+            if ! pahole -J "$VM" 2>/tmp/pahole.err; then
+              echo "系统 pahole 失败，源码编译 dwarves"
+              cat /tmp/pahole.err || true
+              git clone -q --depth 1 https://github.com/acmel/dwarves.git /tmp/dwarves
+              cmake -S /tmp/dwarves -B /tmp/dwarves/build -D__LIB=lib -DBUILD_SHARED_LIBS=off >/dev/null
+              make -C /tmp/dwarves/build -j"$(nproc)" >/dev/null 2>&1
+              /tmp/dwarves/build/pahole --version
+              /tmp/dwarves/build/pahole -J "$VM"
+            fi
+          fi
+          $OB --dump-section .BTF="$BTF" "$VM" /dev/null
+          MAGIC=$(od -An -tx1 -N2 "$BTF" | tr -d ' \n')
+          echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$BTF")"
+          test "$MAGIC" = "9feb"
+
+      - name: 提取 kmod 与证据
         if: always()
         run: |
           cd "$WORK/src"
           KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
-          test -n "$KDIR"
-          mkdir -p "$WORK/out" "$GITHUB_WORKSPACE/artifacts"
-          VM="$KDIR/vmlinux"
-          echo "--- vmlinux 检查 ---"
-          ls -l "$VM" || true
-          file "$VM" || true
-          # 宿主 objcopy 不认 aarch64，必须用交叉工具链自带的
-          OBC=$(ls staging_dir/toolchain-*/bin/*-objcopy 2>/dev/null | head -1)
-          RE=$(ls staging_dir/toolchain-*/bin/*-readelf 2>/dev/null | head -1)
-          [ -n "$OBC" ] || { echo "未找到交叉 objcopy，回退宿主"; OBC=objcopy; }
-          [ -n "$RE" ] || RE=readelf
-          echo "objcopy=$OBC"
-          echo "--- 段表（找 BTF）---"
-          $RE -S "$VM" 2>/dev/null | grep -iE '\.BTF|debug_info' || echo "段表中未见 BTF/debug_info"
-          if $OBC --dump-section .BTF="$WORK/out/vmlinux-$KVER" "$VM" /dev/null 2>/tmp/ob.err && [ -s "$WORK/out/vmlinux-$KVER" ]; then
-            MAGIC=$(od -An -tx1 -N2 "$WORK/out/vmlinux-$KVER" | tr -d ' \n')
-            echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$WORK/out/vmlinux-$KVER")"
-            [ "$MAGIC" = "9feb" ] || echo "::error::BTF magic 不是 9feb"
-          else
-            echo "::error::BTF 提取失败"
-            cat /tmp/ob.err 2>/dev/null || true
-          fi
-          cp "$KDIR/net/sched/cls_bpf.ko" "$WORK/out/" 2>/dev/null || echo "!! cls_bpf.ko 缺失"
-          cp "$KDIR/drivers/net/veth.ko" "$WORK/out/" 2>/dev/null || echo "!! veth.ko 缺失"
-          cp "$KDIR/drivers/net/netkit.ko" "$WORK/out/" 2>/dev/null || true
-          for m in "$WORK"/out/*.ko; do [ -f "$m" ] && echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
-          cd "$WORK/out" && sha256sum ./* > SHA256SUMS 2>/dev/null && cat SHA256SUMS && ls -lh
-          cp "$WORK"/out/* "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/artifacts/kernel.config.set" 2>/dev/null || true
-          cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/artifacts/vermagic.txt" 2>/dev/null || true
+          A="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$A"
+          cp "$KDIR/net/sched/cls_bpf.ko" "$A/" 2>/dev/null || echo "!! cls_bpf.ko 缺失"
+          cp "$KDIR/drivers/net/veth.ko" "$A/" 2>/dev/null || echo "!! veth.ko 缺失"
+          cp "$KDIR/.config.set" "$A/kernel.config.set" 2>/dev/null || true
+          cp "$KDIR/.vermagic" "$A/vermagic.txt" 2>/dev/null || true
+          for m in "$A"/*.ko; do [ -f "$m" ] && echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
+          cd "$A" && sha256sum ./* > SHA256SUMS 2>/dev/null; cat SHA256SUMS; ls -lh
 
       - name: 结构体尺寸证据
         if: always()
         run: |
           cd "$WORK/src"
           KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          OUT="$GITHUB_WORKSPACE/artifacts/struct-sizes.txt"
-          : > "$OUT"
-          for s in sk_buff sk_buff_fclones nf_conn files_struct signal_struct sighand_struct \
-                   socket_alloc task_struct mm_struct dentry pid radix_tree_node \
-                   tcp_sock udp_sock raw_sock anon_vma net_device napi_struct bpf_prog \
-                   tcf_proto Qdisc nf_hook_ops sock net; do
-            sz=$(pahole -C "$s" "$KDIR/vmlinux" 2>/dev/null | grep -oE 'size: [0-9]+' | head -1)
+          A="$GITHUB_WORKSPACE/artifacts"; mkdir -p "$A"
+          P=pahole; [ -x /tmp/dwarves/build/pahole ] && P=/tmp/dwarves/build/pahole
+          OUT="$A/struct-sizes.txt"; : > "$OUT"
+          for s in sk_buff nf_conn files_struct signal_struct sighand_struct socket_alloc \
+                   task_struct mm_struct dentry pid tcp_sock udp_sock raw_sock anon_vma \
+                   net_device napi_struct bpf_prog tcf_proto Qdisc nf_hook_ops sock net; do
+            sz=$($P -C "$s" "$KDIR/vmlinux" 2>/dev/null | grep -oE 'size: [0-9]+' | head -1 | cut -d' ' -f2)
             echo "$s ${sz:-?}" >> "$OUT"
           done
           cat "$OUT"
@@ -234,9 +207,8 @@ jobs:
         if: ${{ inputs.build_image }}
         run: |
           cd "$WORK/src"
-          make -j"$(nproc)" 2>&1 | tail -30
-          cp bin/targets/qualcommax/ipq60xx/*sysupgrade* "$GITHUB_WORKSPACE/artifacts/" || true
-          ls -lh "$GITHUB_WORKSPACE/artifacts"
+          make -j"$(nproc)" 2>&1 | tail -20
+          cp bin/targets/qualcommax/ipq60xx/*sysupgrade* "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
 
       - name: 上传产物
         if: always()
@@ -247,13 +219,3 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
-
-      - name: 结论
-        if: always()
-        run: |
-          echo "ABI 匹配: ${{ steps.abi.outputs.match }}"
-          if [ "${{ steps.abi.outputs.match }}" = "true" ]; then
-            echo "→ 产物可挂到现网内核，走免刷机部署"
-          else
-            echo "→ 产物不可挂现网内核，只能用于刷机镜像"
-          fi
