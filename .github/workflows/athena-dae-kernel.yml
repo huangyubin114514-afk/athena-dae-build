@@ -148,27 +148,40 @@ jobs:
           KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
           VM="$KDIR/vmlinux"
           ls -l "$VM"; file "$VM" || true
-          OB=$(ls staging_dir/toolchain-*/bin/*-objcopy | head -1)
-          RE=$(ls staging_dir/toolchain-*/bin/*-readelf | head -1)
-          [ -n "$OB" ] || OB=objcopy
-          [ -n "$RE" ] || RE=readelf
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           BTF="$GITHUB_WORKSPACE/artifacts/vmlinux-$KVER"
-          if $RE -S "$VM" 2>/dev/null | grep -q '\.BTF'; then
-            echo "内核自带 .BTF，直接抽取"
-          else
-            echo "内核无 .BTF，手工用 pahole 生成"
-            if ! pahole -J "$VM" 2>/tmp/pahole.err; then
-              echo "系统 pahole 失败，源码编译 dwarves"
-              cat /tmp/pahole.err || true
-              git clone -q --depth 1 https://github.com/acmel/dwarves.git /tmp/dwarves
-              cmake -S /tmp/dwarves -B /tmp/dwarves/build -D__LIB=lib -DBUILD_SHARED_LIBS=off >/dev/null
-              make -C /tmp/dwarves/build -j"$(nproc)" >/dev/null 2>&1
-              /tmp/dwarves/build/pahole --version
+
+          # 关键：不要用 pahole -J（它会调 objcopy 把 .BTF 写回 vmlinux，
+          # 系统 pahole 调 llvm-objcopy、源码版调宿主 objcopy，两者都不认 aarch64）。
+          # --btf_encode_detached 直接产出独立 BTF 文件，完全不碰 objcopy。
+          encode() {
+            $1 --btf_encode_detached="$BTF" "$VM"
+          }
+
+          echo "== 尝试 1：系统 pahole（detached）=="
+          pahole --version
+          if ! encode pahole 2>/tmp/e1.err; then
+            cat /tmp/e1.err || true
+            echo "== 尝试 2：源码编 dwarves（detached）=="
+            git clone -q --depth 1 https://github.com/acmel/dwarves.git /tmp/dwarves || true
+            cmake -S /tmp/dwarves -B /tmp/dwarves/build -DBUILD_SHARED_LIBS=off >/dev/null 2>&1 || true
+            mkdir -p /tmp/dwarves/lib/bpf
+            make -C /tmp/dwarves/build -j"$(nproc)" >/dev/null 2>&1 || true
+            /tmp/dwarves/build/pahole --version || true
+            if ! encode /tmp/dwarves/build/pahole 2>/tmp/e2.err; then
+              cat /tmp/e2.err || true
+              echo "== 尝试 3：给 pahole 喂交叉 objcopy 再 -J =="
+              OBC=$(ls staging_dir/toolchain-*/bin/*-objcopy | head -1)
+              mkdir -p /tmp/xbin
+              ln -sf "$(readlink -f "$OBC")" /tmp/xbin/objcopy
+              ln -sf "$(readlink -f "$OBC")" /tmp/xbin/llvm-objcopy
+              export PATH=/tmp/xbin:$PATH
+              which objcopy; objcopy --version | head -1
               /tmp/dwarves/build/pahole -J "$VM"
+              objcopy --dump-section .BTF="$BTF" "$VM" /dev/null
             fi
           fi
-          $OB --dump-section .BTF="$BTF" "$VM" /dev/null
+
           MAGIC=$(od -An -tx1 -N2 "$BTF" | tr -d ' \n')
           echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$BTF")"
           test "$MAGIC" = "9feb"
