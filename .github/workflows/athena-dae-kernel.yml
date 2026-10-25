@@ -136,6 +136,7 @@ jobs:
         with:
           name: abi-evidence-${{ github.run_id }}
           path: evidence/
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
@@ -194,6 +195,23 @@ jobs:
           cd "$WORK/out" && sha256sum ./* > SHA256SUMS && cat SHA256SUMS && ls -lh
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cp "$WORK"/out/* "$GITHUB_WORKSPACE/artifacts/"
+          cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/artifacts/kernel.config.set" || true
+          cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/artifacts/vermagic.txt" || true
+
+      - name: 结构体尺寸证据
+        run: |
+          cd "$WORK/src"
+          KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          OUT="$GITHUB_WORKSPACE/artifacts/struct-sizes.txt"
+          : > "$OUT"
+          for s in sk_buff net_device napi_struct bpf_prog tcf_proto Qdisc nf_hook_ops sock; do
+            sz=$(pahole -C "$s" "$KDIR/vmlinux" 2>/dev/null | grep -oE 'size: [0-9]+' | head -1)
+            echo "$s $sz" >> "$OUT"
+          done
+          cat "$OUT"
+          echo "--- vmlinux ---"
+          ls -l "$KDIR/vmlinux"; size "$KDIR/vmlinux" 2>/dev/null || true
 
       - name: 完整镜像（可选）
         if: ${{ inputs.build_image }}
@@ -208,6 +226,7 @@ jobs:
         with:
           name: athena-dae-kernel-${{ github.run_id }}
           path: artifacts/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
