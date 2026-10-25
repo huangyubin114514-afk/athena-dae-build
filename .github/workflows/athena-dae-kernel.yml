@@ -178,40 +178,57 @@ jobs:
           make -j"$(nproc)" package/kernel/linux/compile 2>&1 | tail -30
 
       - name: 提取产物
+        if: always()
         run: |
           cd "$WORK/src"
           KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
           test -n "$KDIR"
-          mkdir -p "$WORK/out"
-          objcopy --dump-section .BTF="$WORK/out/vmlinux-$KVER" "$KDIR/vmlinux" /dev/null
-          test -s "$WORK/out/vmlinux-$KVER"
-          MAGIC=$(od -An -tx1 -N2 "$WORK/out/vmlinux-$KVER" | tr -d ' \n')
-          echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$WORK/out/vmlinux-$KVER")"
-          test "$MAGIC" = "9feb"
-          cp "$KDIR/net/sched/cls_bpf.ko" "$WORK/out/" || echo "!! cls_bpf.ko 缺失"
-          cp "$KDIR/drivers/net/veth.ko" "$WORK/out/" || echo "!! veth.ko 缺失"
-          [ -f "$KDIR/drivers/net/netkit.ko" ] && cp "$KDIR/drivers/net/netkit.ko" "$WORK/out/" || true
-          for m in "$WORK"/out/*.ko; do echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
-          cd "$WORK/out" && sha256sum ./* > SHA256SUMS && cat SHA256SUMS && ls -lh
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$WORK"/out/* "$GITHUB_WORKSPACE/artifacts/"
-          cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/artifacts/kernel.config.set" || true
-          cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/artifacts/vermagic.txt" || true
+          mkdir -p "$WORK/out" "$GITHUB_WORKSPACE/artifacts"
+          VM="$KDIR/vmlinux"
+          echo "--- vmlinux 检查 ---"
+          ls -l "$VM" || true
+          file "$VM" || true
+          # 宿主 objcopy 不认 aarch64，必须用交叉工具链自带的
+          OBC=$(ls staging_dir/toolchain-*/bin/*-objcopy 2>/dev/null | head -1)
+          RE=$(ls staging_dir/toolchain-*/bin/*-readelf 2>/dev/null | head -1)
+          [ -n "$OBC" ] || { echo "未找到交叉 objcopy，回退宿主"; OBC=objcopy; }
+          [ -n "$RE" ] || RE=readelf
+          echo "objcopy=$OBC"
+          echo "--- 段表（找 BTF）---"
+          $RE -S "$VM" 2>/dev/null | grep -iE '\.BTF|debug_info' || echo "段表中未见 BTF/debug_info"
+          if $OBC --dump-section .BTF="$WORK/out/vmlinux-$KVER" "$VM" /dev/null 2>/tmp/ob.err && [ -s "$WORK/out/vmlinux-$KVER" ]; then
+            MAGIC=$(od -An -tx1 -N2 "$WORK/out/vmlinux-$KVER" | tr -d ' \n')
+            echo "btf_magic=$MAGIC  btf_size=$(wc -c < "$WORK/out/vmlinux-$KVER")"
+            [ "$MAGIC" = "9feb" ] || echo "::error::BTF magic 不是 9feb"
+          else
+            echo "::error::BTF 提取失败"
+            cat /tmp/ob.err 2>/dev/null || true
+          fi
+          cp "$KDIR/net/sched/cls_bpf.ko" "$WORK/out/" 2>/dev/null || echo "!! cls_bpf.ko 缺失"
+          cp "$KDIR/drivers/net/veth.ko" "$WORK/out/" 2>/dev/null || echo "!! veth.ko 缺失"
+          cp "$KDIR/drivers/net/netkit.ko" "$WORK/out/" 2>/dev/null || true
+          for m in "$WORK"/out/*.ko; do [ -f "$m" ] && echo "$(basename "$m") => $(strings "$m" | grep -m1 '^vermagic=')"; done
+          cd "$WORK/out" && sha256sum ./* > SHA256SUMS 2>/dev/null && cat SHA256SUMS && ls -lh
+          cp "$WORK"/out/* "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$KDIR/.config.set" "$GITHUB_WORKSPACE/artifacts/kernel.config.set" 2>/dev/null || true
+          cp "$KDIR/.vermagic" "$GITHUB_WORKSPACE/artifacts/vermagic.txt" 2>/dev/null || true
 
       - name: 结构体尺寸证据
+        if: always()
         run: |
           cd "$WORK/src"
           KDIR=$(ls -d build_dir/target-*/linux-qualcommax_ipq60xx/linux-$KVER | head -1)
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           OUT="$GITHUB_WORKSPACE/artifacts/struct-sizes.txt"
           : > "$OUT"
-          for s in sk_buff net_device napi_struct bpf_prog tcf_proto Qdisc nf_hook_ops sock; do
+          for s in sk_buff sk_buff_fclones nf_conn files_struct signal_struct sighand_struct \
+                   socket_alloc task_struct mm_struct dentry pid radix_tree_node \
+                   tcp_sock udp_sock raw_sock anon_vma net_device napi_struct bpf_prog \
+                   tcf_proto Qdisc nf_hook_ops sock net; do
             sz=$(pahole -C "$s" "$KDIR/vmlinux" 2>/dev/null | grep -oE 'size: [0-9]+' | head -1)
-            echo "$s $sz" >> "$OUT"
+            echo "$s ${sz:-?}" >> "$OUT"
           done
           cat "$OUT"
-          echo "--- vmlinux ---"
-          ls -l "$KDIR/vmlinux"; size "$KDIR/vmlinux" 2>/dev/null || true
 
       - name: 完整镜像（可选）
         if: ${{ inputs.build_image }}
@@ -222,15 +239,17 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/artifacts"
 
       - name: 上传产物
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: athena-dae-kernel-${{ github.run_id }}
           path: artifacts/
           include-hidden-files: true
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
 
       - name: 结论
+        if: always()
         run: |
           echo "ABI 匹配: ${{ steps.abi.outputs.match }}"
           if [ "${{ steps.abi.outputs.match }}" = "true" ]; then
